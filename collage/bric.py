@@ -1,126 +1,155 @@
 import numpy as np
 
 from collections import namedtuple
+from dataclasses import dataclass
+from numbers import Real
+from typing import List
 
-Size = namedtuple('Size', ['h', 'w'])
+from .layout import Layout
+
+
+Size = namedtuple('Size', ['w', 'h'])
 Position = namedtuple('Position', ['x', 'y'])
 
 
-def fit_pictures(image_sizes, layout='horizontal', spacing=0):
+@dataclass(frozen=True)
+class Constraint:
+    is_height: bool
+    positive_ids: list
+    negative_ids: list
+    result: Real = 0
+
+
+def fit_pictures_balanced(image_sizes, layout='horizontal'):
     image_sizes = [Size(h, w) for h, w in image_sizes]
-    return _compute_layout(image_sizes, layout == 'horizontal', spacing)
+    layout = Layout.balanced_layout(len(image_sizes), layout == 'horizontal')
+
+    return fit_pictures(image_sizes, layout)
 
 
-def _compute_layout(image_sizes, is_horizontal, spacing):
+def fit_pictures_grid(image_sizes, *, cols=None, rows=None):
+    image_sizes = [Size(h, w) for h, w in image_sizes]
+    layout = Layout.grid_layout(len(image_sizes), cols=cols, rows=rows)
+
+    return fit_pictures(image_sizes, layout)
+
+
+def fit_pictures(image_sizes: List[Size], layout: Layout):
+    new_sizes = _compute_rescaled_image_sizes(image_sizes, layout)
+    positions, canvas_size = _compute_positions(new_sizes, layout)
+
+    return new_sizes, positions, canvas_size
+
+
+def _compute_rescaled_image_sizes(image_sizes: List[Size], layout: Layout):
+    widths, _, constraints = _get_bbox_constraints(
+        layout.root_bounding_box)
+
+    # for N images, the layout will yield N-1 constraints, so we add an extra
+    # one to obtain a unique solution
+    assert layout.n_images - 1 == len(constraints)
+
+    constraints.append(
+        Constraint(is_height=False,
+                   positive_ids=widths,
+                   negative_ids=[],
+                   result=sum([image_sizes[i].w for i in widths]))
+    )
+
+    # set up and a linear equation system from the constraints, and solve it
     n_images = len(image_sizes)
 
-    aspect_ratios = np.array([h/w for h, w in image_sizes])
-    constraints = np.zeros((n_images, n_images))
+    aspect_ratios = np.array([h/w for w, h in image_sizes])
+    A = np.zeros((n_images, n_images))  # constraints matrix
+    b = np.zeros(n_images)              # rhs of equation Aw = b
 
-    widths, heights, constraints_w, constraints_h = _get_bric_constraints(
-        list(range(n_images)), is_horizontal)
+    for c_idx, c in enumerate(constraints):
+        for img_idx in c.positive_ids:
+            A[c_idx, img_idx] = aspect_ratios[img_idx] if c.is_height else 1
 
-    cn = 0
-    for cw in constraints_w:
-        for idx in cw:
-            if idx > 0:
-                constraints[cn, idx - 1] = 1
-            else:
-                constraints[cn, -idx - 1] = -1
-        cn += 1
+        for img_idx in c.negative_ids:
+            A[c_idx, img_idx] = -(aspect_ratios[img_idx] if c.is_height else 1)
 
-    for ch in constraints_h:
-        for idx in ch:
-            if idx > 0:
-                constraints[cn, idx - 1] = aspect_ratios[idx - 1]
-            else:
-                constraints[cn, -idx - 1] = -aspect_ratios[-idx - 1]
-        cn += 1
+        b[c_idx] = c.result
 
-    total_width = 0
-    for idx in widths:
-        constraints[-1, idx - 1] = 1
-        total_width += image_sizes[idx - 1].w
-
-    b = np.zeros(n_images)
-    b[-1] = total_width
-
-    print(constraints)
-    print(b)
-
-    new_widths = np.linalg.solve(constraints, b)
+    new_widths = np.linalg.solve(A, b)
     new_heights = aspect_ratios * new_widths
 
-    new_sizes = [Size(h, w) for h, w in zip(new_heights, new_widths)]
-    positions = _compute_positions(new_sizes, is_horizontal, spacing)
+    new_sizes = [Size(w, h) for w, h in zip(new_widths, new_heights)]
 
-    canvas_height = sum([new_sizes[idx - 1].h for idx in heights])
-    canvas_height += (len(heights) - 1) * spacing
-    canvas_width = sum([new_sizes[idx - 1].w for idx in widths])
-    canvas_width += (len(widths) - 1) * spacing
-    canvas_size = Size(canvas_height, canvas_width)
-
-    return canvas_size, new_sizes, positions
+    return new_sizes
 
 
-def _get_bric_constraints(images, is_horizontal):
-    n_images = len(images)
-
-    if n_images == 1:
-        # index from 1 to allow for sign to indicate sign of constraint
-        widths = [images[0] + 1]
-        heights = [images[0] + 1]
-        constraints_w = []
-        constraints_h = []
-
+def _get_bbox_constraints(bbox):
+    if bbox.is_leaf:
+        widths = [bbox.leaf_id]
+        heights = [bbox.leaf_id]
+        constraints = []
     else:
-        w1, h1, cw1, ch1 = _get_bric_constraints(images[:n_images // 2],
-                                                 not is_horizontal)
-        w2, h2, cw2, ch2 = _get_bric_constraints(images[n_images // 2:],
-                                                 not is_horizontal)
+        c_widths, c_heights, c_constraints = zip(*[_get_bbox_constraints(c)
+                                                   for c in bbox.children])
 
-        if is_horizontal:
-            # widths add up, heights yield constraints
-            widths = w1 + w2
-            # keep the shortest height to make linear system sparser
-            heights = h1 if len(h1) < len(h2) else h2
-            constraints_w = cw1 + cw2
-            constraints_h = ch1 + ch2 + [h1 + [-h for h in h2]]
+        if bbox.is_horizontal:
+            # widths add up
+            widths = sum(c_widths, [])
+
+            # pick the child with fewest number of height components
+            # to make constraints sparser
+            heights = min(c_heights, key=len)
+
+            constraints = sum(c_constraints, [])
+
+            # add a height constraints
+            for i in range(len(c_heights) - 1):
+                constraints.append(
+                    Constraint(is_height=True,
+                               positive_ids=c_heights[i],
+                               negative_ids=c_heights[i + 1]))
         else:
-            # heights add up, widths yield constraints
-            heights = h1 + h2
-            # keep the shortest width to make linear system sparser
-            widths = w1 if len(w1) < len(w2) else w2
-            constraints_h = ch1 + ch2
-            constraints_w = cw1 + cw2 + [w1 + [-w for w in w2]]
+            # heights add up
+            heights = sum(c_heights, [])
 
-    return widths, heights, constraints_w, constraints_h
+            # pick the child with fewest number of width components
+            # to make constraints sparser
+            widths = min(c_widths, key=len)
+
+            constraints = sum(c_constraints, [])
+
+            # add a width constraints
+            for i in range(len(c_widths) - 1):
+                constraints.append(
+                    Constraint(is_height=False,
+                               positive_ids=c_widths[i],
+                               negative_ids=c_widths[i + 1]))
+
+    return widths, heights, constraints
 
 
-def _compute_positions(image_sizes, is_horizontal, spacing):
-    positions = [None] * len(image_sizes)
-
-    def _c(images, is_horizontal, top_left):
-        n_images = len(images)
-
-        if n_images == 1:
-            positions[images[0]] = top_left
-            return image_sizes[images[0]]
+def _compute_positions(image_sizes: List[Size], layout: Layout):
+    def _c(bbox, top_left: Position = Position(0, 0)):
+        if bbox.is_leaf == 1:
+            positions = [(bbox.leaf_id, top_left)]
+            size = image_sizes[bbox.leaf_id]
         else:
-            size1 = _c(images[:n_images // 2], not is_horizontal, top_left)
+            positions = []
+            size = Size(0, 0)
+            for bbox_child in bbox.children:
+                c_positions, c_size = _c(bbox_child, top_left)
+                positions.extend(c_positions)
 
-            if is_horizontal:
-                top_left = Position(top_left.x + size1.w + spacing, top_left.y)
-            else:
-                top_left = Position(top_left.x, top_left.y + size1.h + spacing)
+                if bbox.is_horizontal:
+                    top_left = Position(top_left.x + c_size.w, top_left.y)
+                    size = Size(size.w + c_size.w, c_size.h)
+                else:
+                    top_left = Position(top_left.x, top_left.y + c_size.h)
+                    size = Size(c_size.w, size.h + c_size.h)
 
-            size2 = _c(images[n_images // 2:], not is_horizontal, top_left)
+        return positions, size
 
-            if is_horizontal:
-                return Size(size1.h, size1.w + size2.w + spacing)
-            else:
-                return Size(size1.h + size2.h + spacing, size1.w)
+    positions, canvas_size = _c(layout.root_bounding_box)
+    assert len(positions) == len(image_sizes)
 
-    _c(list(range(len(image_sizes))), is_horizontal, Position(0, 0))
+    # sort positions so they match the image size indices
+    positions = [p[1] for p in sorted(positions)]
 
-    return positions
+    return positions, canvas_size
