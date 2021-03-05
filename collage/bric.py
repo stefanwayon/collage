@@ -1,79 +1,48 @@
 import numpy as np
 
-from collections import namedtuple
-from dataclasses import dataclass
-from numbers import Real
-from typing import List, Tuple, Union
+from typing import List, Tuple
 
-from .layout import Layout
-
-SizeOrTuple = Tuple[Real, Real]
+from .layout import Layout, BalancedLayout, Size, Position
 
 
-class Size(namedtuple('Size', ['w', 'h'])):
-    def __add__(self, other: SizeOrTuple):
-        other_w, other_h = other
-        return Size(self.w + other_w, self.h + other_h)
+def fit_pictures_balanced(image_sizes,
+                          layout='horizontal',
+                          border=0,
+                          spacing=0,
+                          round_result=False) -> Tuple[List[Size], List[Position], Size]:
+    if round_result:
+        assert isinstance(border, int)
+        assert isinstance(spacing, int)
 
-    def __sub__(self, other: SizeOrTuple):
-        other_w, other_h = other
-        return Size(self.w - other_w, self.h - other_h)
-
-    def __round__(self):
-        return Size(*map(round, self))
-
-    def __truediv__(self, divisor: Union[Real, SizeOrTuple]):
-        if isinstance(divisor, Real):
-            return Size(self.w / divisor, self.h / divisor)
-        else:
-            div_w, div_h = divisor
-            return Size(self.w / div_w, self.h / div_h)
-
-
-class Position(namedtuple('Position', ['x', 'y'])):
-    def __add__(self, other: Union[Tuple[Real, Real], Size]):
-        other_w, other_h = other
-        return Position(self.x + other_w, self.y + other_h)
-
-    def __round__(self):
-        return Size(*map(round, self))
-
-
-@dataclass(frozen=True)
-class Constraint:
-    is_height: bool
-    positive_ids: list
-    negative_ids: list
-    result: Real = 0
-
-
-def fit_pictures_balanced(image_sizes, layout='horizontal', round_result=False):
-    image_sizes = [Size(h, w) for h, w in image_sizes]
-    layout = Layout.balanced_layout(len(image_sizes), layout == 'horizontal')
+    image_sizes = [Size(w, h) for w, h in image_sizes]
+    layout = BalancedLayout(len(image_sizes),
+                            horizontal_root=(layout == 'horizontal'),
+                            border=border,
+                            spacing=spacing)
 
     return fit_pictures(image_sizes, layout, round_result)
 
 
-def fit_pictures_grid(image_sizes, *, cols=None, rows=None, round_result=False):
-    image_sizes = [Size(h, w) for h, w in image_sizes]
+def fit_pictures_grid(image_sizes, *, cols=None, rows=None, round_result=False) -> Tuple[List[Size], List[Position], Size]:
+    image_sizes = [Size(w, h) for w, h in image_sizes]
     layout = Layout.grid_layout(len(image_sizes), cols=cols, rows=rows)
 
     return fit_pictures(image_sizes, layout, round_result)
 
 
-def fit_pictures(image_sizes: List[Size], layout: Layout, round_result=False):
+def fit_pictures(image_sizes: List[Size], layout: Layout, round_result=False) -> Tuple[List[Size], List[Position], Size]:
     if round_result:
         new_sizes = _compute_integer_image_sizes(image_sizes, layout)
     else:
         new_sizes = _compute_rescaled_image_sizes(image_sizes, layout)
 
-    positions, canvas_size = _compute_positions(new_sizes, layout)
+    positions, canvas_size = layout.compute_positions(new_sizes)
 
     return new_sizes, positions, canvas_size
 
 
-def _compute_rescaled_image_sizes(image_sizes: List[Size], layout: Layout):
-    constraints = _get_constraints(image_sizes, layout)
+def _compute_rescaled_image_sizes(image_sizes: List[Size], layout: Layout) -> List[Size]:
+    constraints = layout.get_constraints(image_sizes)
 
     # set up and a linear equation system from the constraints, and solve it
     n_images = len(image_sizes)
@@ -99,9 +68,9 @@ def _compute_rescaled_image_sizes(image_sizes: List[Size], layout: Layout):
     return new_sizes
 
 
-def _compute_integer_image_sizes(image_sizes: List[Size], layout: Layout):
+def _compute_integer_image_sizes(image_sizes: List[Size], layout: Layout) -> List[Size]:
     import mip
-    constraints = _get_constraints(image_sizes, layout)
+    constraints = layout.get_constraints(image_sizes)
     aspect_ratios = [h/w for w, h in image_sizes]
 
     # set up a mixed-integer program, and solve it
@@ -152,81 +121,3 @@ def _compute_integer_image_sizes(image_sizes: List[Size], layout: Layout):
     new_sizes = [Size(int(w.x), int(h.x))
                  for w, h in zip(var_widths, var_heights)]
     return new_sizes
-
-
-def _get_constraints(image_sizes, layout):
-    constraints = _get_bbox_constraints(layout.root_bounding_box)
-
-    # for N images, the layout will yield N-1 constraints, so we add an extra
-    # one to obtain a unique solution
-    assert layout.n_images - 1 == len(constraints)
-
-    total_width = (layout.width
-                   or sum([image_sizes[i].w
-                           for i in layout.root_bounding_box.width_ids]))
-    constraints.append(
-        Constraint(is_height=False,
-                   positive_ids=layout.root_bounding_box.width_ids,
-                   negative_ids=[],
-                   result=total_width)
-    )
-
-    return constraints
-
-
-def _get_bbox_constraints(bbox):
-    if bbox.is_leaf:
-        constraints = []
-    else:
-        constraints = sum([_get_bbox_constraints(c) for c in bbox.children], [])
-
-        if bbox.is_horizontal:
-            c_heights = [c.height_ids for c in bbox.children]
-
-            # add a height constraints
-            for i in range(len(c_heights) - 1):
-                constraints.append(
-                    Constraint(is_height=True,
-                               positive_ids=c_heights[i],
-                               negative_ids=c_heights[i + 1]))
-        else:
-            c_widths = [c.width_ids for c in bbox.children]
-
-            # add a width constraints
-            for i in range(len(c_widths) - 1):
-                constraints.append(
-                    Constraint(is_height=False,
-                               positive_ids=c_widths[i],
-                               negative_ids=c_widths[i + 1]))
-
-    return constraints
-
-
-def _compute_positions(image_sizes: List[Size], layout: Layout):
-    def _recurse(bbox, top_left: Position = Position(0, 0)):
-        if bbox.is_leaf == 1:
-            positions = [(bbox.leaf_id, top_left)]
-            size = image_sizes[bbox.leaf_id]
-        else:
-            positions = []
-            size = Size(0, 0)
-            for bbox_child in bbox.children:
-                c_positions, c_size = _recurse(bbox_child, top_left)
-                positions.extend(c_positions)
-
-                if bbox.is_horizontal:
-                    top_left = top_left + (c_size.w, 0)
-                    size = c_size + (size.w, 0)
-                else:
-                    top_left = top_left + (0, c_size.h)
-                    size = c_size + (0, size.h)
-
-        return positions, size
-
-    positions, canvas_size = _recurse(layout.root_bounding_box)
-    assert len(positions) == len(image_sizes)
-
-    # sort positions so they match the image size indices
-    positions = [p[1] for p in sorted(positions)]
-
-    return positions, canvas_size
