@@ -1,6 +1,7 @@
 from abc import abstractmethod
 from dataclasses import dataclass
 from collections import namedtuple
+from functools import cached_property
 from itertools import chain, islice
 from numbers import Real
 from typing import Iterable, Optional, List, Union, Tuple
@@ -120,6 +121,14 @@ class BoundingBox:
     def is_leaf(self) -> bool:
         return self.leaf_id is not None
 
+    @cached_property
+    def n_images(self) -> int:
+        if self.is_leaf:
+            return 1
+        else:
+            assert self.children is not None
+            return sum([c.n_images for c in self.children])
+
     def get_constraints(self, border: Real = 0, spacing: Real = 0) -> List[Constraint]:
         if self.is_leaf:
             constraints = []
@@ -187,46 +196,96 @@ class BoundingBox:
         return positions, canvas_size
 
 
-@dataclass
 class Layout(object):
-    n_images: int
-    width: Optional[Real] = None
-    height: Optional[Real] = None
-    border: Real = 0
-    spacing: Real = 0
+
+    def __init__(
+        self,
+        n_images: int,
+        width: Optional[Real] = None,
+        height: Optional[Real] = None,
+        border: Real = 0,
+        spacing: Real = 0,
+    ):
+        self.n_images = n_images
+        self.width = width
+        self.height = height
+        self.border = border
+        self.spacing = spacing
 
     @abstractmethod
-    def get_constraints(self, image_sizes: List[SizeOrTuple]) -> List[Constraint]:
+    def get_constraints(self, image_sizes: List[Size]) -> List[Constraint]:
         pass
 
     @abstractmethod
-    def compute_positions(self, image_sizes: List[SizeOrTuple]) -> Tuple[List[Position], Size]:
+    def compute_positions(self, image_sizes: List[Size]) -> Tuple[List[Position], Size]:
         pass
 
-    def _get_scale_constraint(self, bbox: BoundingBox, image_sizes: List[Size]) -> Constraint:
+
+class BoundingBoxLayout(Layout):
+    def __init__(
+        self,
+        root_bbox: BoundingBox,
+        width: Optional[Real] = None,
+        height: Optional[Real] = None,
+        border: Real = 0,
+        spacing: Real = 0,
+    ):
+        super().__init__(
+            root_bbox.n_images,
+            width=width,
+            height=height,
+            border=border,
+            spacing=spacing,
+        )
+        self.root_bbox = root_bbox
+
+    def get_constraints(self, image_sizes: List[Size]) -> List[Constraint]:
+        constraints = self.root_bbox.get_constraints(
+            border=self.border, spacing=self.spacing
+        )
+
+        # for N images, the layout will yield N-1 constraints, so we add an
+        # extra one to obtain a unique solution
+        assert self.n_images - 1 == len(constraints)
+
+        constraints.append(self._get_scale_constraint(image_sizes))
+
+        return constraints
+
+    def compute_positions(self, image_sizes: List[Size]) -> Tuple[List[Position], Size]:
+        return self.root_bbox.compute_positions(image_sizes, self.border, self.spacing)
+
+    def _get_scale_constraint(self, image_sizes: List[Size]) -> Constraint:
         if self.height is not None:
-            border_height = 2 * len(bbox.height_ids) * self.border
-            spacing_height = (len(bbox.height_ids) - 1) * self.spacing
+            border_height = 2 * len(self.root_bbox.height_ids) * self.border
+            spacing_height = (len(self.root_bbox.height_ids) - 1) * self.spacing
             img_height = self.height - border_height - spacing_height
 
-            return Constraint(is_height=True,
-                              positive_ids=self._root_bbox.height_ids,
-                              negative_ids=[],
-                              result=img_height)
+            # All image hights that are stacked vertically must add up to the
+            # canvas height without borders and spacing
+            return Constraint(
+                is_height=True,
+                positive_ids=self.root_bbox.height_ids,
+                negative_ids=[],
+                result=img_height,
+            )
         else:
-            border_width = 2 * len(bbox.width_ids) * self.border
-            spacing_width = (len(bbox.width_ids) - 1) * self.spacing
-            natural_width = sum([image_sizes[i].w for i in bbox.width_ids])
-            img_width = ((self.width or natural_width)
-                         - border_width - spacing_width)
+            border_width = 2 * len(self.root_bbox.width_ids) * self.border
+            spacing_width = (len(self.root_bbox.width_ids) - 1) * self.spacing
+            natural_width = sum([image_sizes[i].w for i in self.root_bbox.width_ids])
+            img_width = (self.width or natural_width) - border_width - spacing_width
 
-            return Constraint(is_height=False,
-                              positive_ids=self._root_bbox.width_ids,
-                              negative_ids=[],
-                              result=img_width)
+            # All image widths that are stacked horizontally must add up to the
+            # canvas width without borders and spacing
+            return Constraint(
+                is_height=False,
+                positive_ids=self.root_bbox.width_ids,
+                negative_ids=[],
+                result=img_width,
+            )
 
 
-class BalancedLayout(Layout):
+class BalancedLayout(BoundingBoxLayout):
     def __init__(self,
                  n_images: int, *,
                  horizontal_root: bool = True,
@@ -234,8 +293,6 @@ class BalancedLayout(Layout):
                  height: Optional[Real] = None,
                  border: Real = 0,
                  spacing: Real = 0):
-
-        super().__init__(n_images, width, height, border, spacing)
 
         def _build_bbox_tree(start_id, end_id, is_horizontal):
             if end_id - start_id == 1:
@@ -246,28 +303,11 @@ class BalancedLayout(Layout):
                 bbox_b = _build_bbox_tree(mid_id, end_id, not is_horizontal)
                 return BoundingBox(is_horizontal, children=[bbox_a, bbox_b])
 
-        self._root_bbox = _build_bbox_tree(0, n_images, horizontal_root)
-
-    def get_constraints(self, image_sizes: List[SizeOrTuple]) -> List[Constraint]:
-        constraints = self._root_bbox.get_constraints(
-            border=self.border, spacing=self.spacing)
-
-        # for N images, the layout will yield N-1 constraints, so we add an
-        # extra one to obtain a unique solution
-        assert self.n_images - 1 == len(constraints)
-
-        constraints.append(
-            self._get_scale_constraint(self._root_bbox, image_sizes))
-
-        return constraints
-
-    def compute_positions(self, image_sizes: List[SizeOrTuple]) -> Tuple[List[Position], Size]:
-        return self._root_bbox.compute_positions(image_sizes,
-                                                 self.border,
-                                                 self.spacing)
+        root_bbox = _build_bbox_tree(0, n_images, horizontal_root)
+        super().__init__(root_bbox, width, height, border, spacing)
 
 
-class GridLayout(Layout):
+class GridLayout(BoundingBoxLayout):
     def __init__(self, n_images: int, *,
                  cols: Optional[int] = None,
                  rows: Optional[int] = None,
@@ -276,16 +316,16 @@ class GridLayout(Layout):
                  border: Real = 0,
                  spacing: Real = 0):
 
-        super().__init__(n_images, width, height)
-
         if cols is None and rows is None:
             raise ValueError("Either cols or rows must be set")
 
         if cols is not None and rows is not None:
             raise ValueError("Only one of cols or rows must be set")
 
-        num_per_group = cols if cols is not None else rows
-        root_is_horizontal = rows is not None
+        num_groups = cols if cols is not None else rows
+        assert num_groups is not None
+        num_per_group = n_images / num_groups
+        root_is_horizontal = rows is None
 
         bboxes = []
         for image_ids in _group_iter(range(n_images), num_per_group):
@@ -294,15 +334,29 @@ class GridLayout(Layout):
             bboxes.append(bbox)
 
         root_bbox = BoundingBox(root_is_horizontal, children=bboxes)
+        super().__init__(root_bbox, width, height, border, spacing)
 
-        return Layout(n_images, root_bbox, width=width)
 
-
-def _group_iter(seq: Iterable, group_size: int):
+def _group_iter(seq: Iterable, group_size: int | float):
     assert group_size > 0
     it = iter(seq)
-    while True:
-        try:
-            yield chain((next(it),), islice(it, group_size-1))
-        except StopIteration:
-            break
+
+    n_items = group_size
+    items = []
+
+    for item in it:
+        n_items -= 1
+        items.append(item)
+        if n_items <= 0:
+            yield items
+            items = []
+            n_items += group_size
+
+    if len(items) > 0:
+        yield items
+
+    # while True:
+    #     try:
+    #         yield chain((next(it),), islice(it, group_size-1))
+    #     except StopIteration:
+    #         break

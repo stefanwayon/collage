@@ -2,30 +2,52 @@ import numpy as np
 
 from typing import List, Tuple
 
-from .layout import Layout, BalancedLayout, Size, Position
+from .layout import Layout, GridLayout, BalancedLayout, Size, Position
 
 
-def fit_pictures_balanced(image_sizes,
-                          layout='horizontal',
-                          border=0,
-                          spacing=0,
-                          round_result=False) -> Tuple[List[Size], List[Position], Size]:
+def fit_pictures_balanced(
+    image_sizes,
+    layout="horizontal",
+    width=None,
+    border=0,
+    spacing=0,
+    round_result=False,
+) -> Tuple[List[Size], List[Position], Size]:
     if round_result:
         assert isinstance(border, int)
         assert isinstance(spacing, int)
 
     image_sizes = [Size(w, h) for w, h in image_sizes]
-    layout = BalancedLayout(len(image_sizes),
-                            horizontal_root=(layout == 'horizontal'),
-                            border=border,
-                            spacing=spacing)
+    layout = BalancedLayout(
+        len(image_sizes),
+        horizontal_root=(layout == "horizontal"),
+        width=width,
+        border=border,
+        spacing=spacing,
+    )
 
     return fit_pictures(image_sizes, layout, round_result)
 
 
-def fit_pictures_grid(image_sizes, *, cols=None, rows=None, round_result=False) -> Tuple[List[Size], List[Position], Size]:
+def fit_pictures_grid(
+    image_sizes,
+    *,
+    cols=None,
+    rows=None,
+    width=None,
+    border=0,
+    spacing=0,
+    round_result=False
+) -> Tuple[List[Size], List[Position], Size]:
     image_sizes = [Size(w, h) for w, h in image_sizes]
-    layout = Layout.grid_layout(len(image_sizes), cols=cols, rows=rows)
+    layout = GridLayout(
+        len(image_sizes),
+        cols=cols,
+        rows=rows,
+        width=width,
+        border=border,
+        spacing=spacing,
+    )
 
     return fit_pictures(image_sizes, layout, round_result)
 
@@ -46,10 +68,11 @@ def _compute_rescaled_image_sizes(image_sizes: List[Size], layout: Layout) -> Li
 
     # set up and a linear equation system from the constraints, and solve it
     n_images = len(image_sizes)
+    n_constraints = len(constraints)
 
     aspect_ratios = np.array([h/w for w, h in image_sizes])
-    A = np.zeros((n_images, n_images))  # constraints matrix
-    b = np.zeros(n_images)              # rhs of equation Aw = b
+    A = np.zeros((n_constraints, n_images))  # constraints matrix
+    b = np.zeros(n_constraints)  # rhs of equation Aw = b
 
     for c_idx, c in enumerate(constraints):
         for img_idx in c.positive_ids:
