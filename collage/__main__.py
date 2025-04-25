@@ -19,8 +19,9 @@ def make_pil_collage(
         image_sizes, width=width, border=border, spacing=spacing, round_result=True
     )
 
-    canvas = Image.new('RGBA', (ceil(canvas_size.w), ceil(canvas_size.h)),
-                       background_colour)
+    canvas = Image.new(
+        "RGB", (ceil(canvas_size.w), ceil(canvas_size.h)), background_colour
+    )
 
     if border > 0:
         draw = ImageDraw.Draw(canvas)
