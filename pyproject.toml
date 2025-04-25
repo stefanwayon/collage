@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "collage"
+version = "0.1.0"
+description = "A library for creating image collages that maintain aspect ratios without cropping."
+authors = ["Ștefan Săftescu <stefan.saftescu@gmail.com>"]
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/stefanwayon/collage"
+repository = "https://github.com/stefanwayon/collage"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+pillow = ">=9.0"
+numpy = ">=2.2"
+mip = "1.16rc0"
+
